@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import requests
 import re
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Body
@@ -13,8 +14,15 @@ load_dotenv()
 
 # We default to qwen2.5-coder:7b as requested for faster inference
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+DEBUG_PRINT_CHUNKS = os.getenv("DEBUG_PRINT_CHUNKS", "false").lower() == "true"
 WORKSPACE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_MANIFEST_PATH = os.path.join(WORKSPACE_DIR, "processed_data", "rag_kb_manifest.json")
+
+# Sarvam AI API Configuration
+USE_SARVAM_API = os.getenv("USE_SARVAM_API", "false").lower() == "true"
+SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
+SARVAM_MODEL = os.getenv("SARVAM_MODEL", "sarvam-30b")
 
 app = FastAPI(title="SewaSetu RAG API Server")
 
@@ -47,6 +55,15 @@ def load_manifest():
         print(f"[API] Cached {len(SERVICES_MAP)} services from manifest.")
     except Exception as e:
         print(f"[API] Error loading manifest catalog: {e}")
+
+    # Pre-load embedder model on startup to avoid first-query latency
+    try:
+        from backend.embeddings.embedder import get_embedder_model
+        print("[API] Pre-loading embedding model on startup...")
+        get_embedder_model()
+        print("[API] Embedding model pre-loaded successfully.")
+    except Exception as e:
+        print(f"[API] Error pre-loading embedding model: {e}")
 
 # API Validation schemas
 class Message(BaseModel):
@@ -158,9 +175,10 @@ def chat_with_bot(request: ChatRequest):
     user_query = request.messages[-1].content
     language = request.language
     
-    # 1. Query Chroma vector store
+    # 1. Query Chroma vector store (with timing)
     candidates = []
     metadata_doc = None
+    retrieval_start = time.perf_counter()
     try:
         from backend.vector_store.chroma_store import query_vector_store, get_collection
         
@@ -179,6 +197,9 @@ def chat_with_bot(request: ChatRequest):
         candidates = query_vector_store(user_query, lang=language, limit=3, sno=request.selected_sno)
     except Exception as e:
         print(f"[API] Error querying vector store: {e}")
+    finally:
+        retrieval_elapsed = time.perf_counter() - retrieval_start
+        print(f"\n[TIMING] ⏱  Chunk retrieval took: {retrieval_elapsed:.3f}s")
         
     # Budget-based context compile with source labeling
     context_parts = []
@@ -208,6 +229,18 @@ def chat_with_bot(request: ChatRequest):
         current_length += chunk_len
         
     retrieved_context = "\n\n---\n\n".join(context_parts)
+
+    # ── DEBUG: Print chunks being passed to the LLM ──────────────────────────
+    if DEBUG_PRINT_CHUNKS:
+        print("\n" + "=" * 70)
+        print(f"[DEBUG] Query: {user_query}")
+        print(f"[DEBUG] Language: {language} | Selected SNO: {request.selected_sno}")
+        print(f"[DEBUG] Total chunks passed to LLM: {len(context_parts)}")
+        for idx, part in enumerate(context_parts, 1):
+            print(f"\n--- Chunk {idx} ---")
+            print(part[:1000] + ("..." if len(part) > 1000 else ""))  # Truncate very long chunks for readability
+        print("=" * 70 + "\n")
+    # ─────────────────────────────────────────────────────────────────────────
     
     # Construct System prompt instructions
     if language == "hi":
@@ -247,39 +280,90 @@ def chat_with_bot(request: ChatRequest):
     # Format message history
     history = request.messages[-7:-1] if len(request.messages) > 1 else []
     
-    prompt_parts = [f"System: {system_instruction}"]
-    for msg in history:
-        role_label = "User" if msg.role == "user" else "Assistant"
-        prompt_parts.append(f"{role_label}: {msg.content}")
-    prompt_parts.append(f"User: {user_query}")
-    prompt_parts.append("Assistant: ")
-    
-    full_prompt = "\n\n".join(prompt_parts)
-    
-    # Query Ollama HTTP API
-    try:
-        url = "http://localhost:11434/api/generate"
-        payload = {
-            "model": OLLAMA_MODEL,
-            "prompt": full_prompt,
-            "stream": False,
-            "options": {
+    # Check if we should use Sarvam AI API or fall back to local Ollama
+    if USE_SARVAM_API and SARVAM_API_KEY:
+        generation_start = time.perf_counter()
+        try:
+            # Construct standard chat messages format for OpenAI-compatible endpoint
+            sarvam_messages = [{"role": "system", "content": system_instruction}]
+            for msg in history:
+                sarvam_messages.append({"role": msg.role, "content": msg.content})
+            sarvam_messages.append({"role": "user", "content": user_query})
+            
+            url = "https://api.sarvam.ai/v1/chat/completions"
+            headers = {
+                "api-subscription-key": SARVAM_API_KEY,
+                "Authorization": f"Bearer {SARVAM_API_KEY}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "model": SARVAM_MODEL,
+                "messages": sarvam_messages,
                 "temperature": 0.0
             }
-        }
-        res = requests.post(url, json=payload, timeout=150)
-        if res.status_code == 200:
-            bot_reply = res.json().get("response", "").strip()
-            # Clean reasoning/thinking tags
-            bot_reply = re.sub(r'<think>.*?</think>', '', bot_reply, flags=re.DOTALL)
-            bot_reply = bot_reply.strip()
-            return {"response": bot_reply}
-        else:
-            raise HTTPException(status_code=500, detail=f"Ollama server returned code {res.status_code}")
             
-    except Exception as e:
-        print(f"[API] Ollama HTTP execution exception: {e}")
-        raise HTTPException(status_code=500, detail=f"Error communicating with local LLM: {str(e)}")
+            print(f"[API] Querying Sarvam AI API (Model: {SARVAM_MODEL})...")
+            res = requests.post(url, json=payload, headers=headers, timeout=120)
+            
+            if res.status_code == 200:
+                generation_elapsed = time.perf_counter() - generation_start
+                print(f"[TIMING] ⚡ Answer generation (Sarvam AI) took: {generation_elapsed:.3f}s")
+                print(f"[TIMING] 📊 Total request time: {retrieval_elapsed + generation_elapsed:.3f}s\n")
+                bot_reply = res.json()["choices"][0]["message"]["content"].strip()
+                # Clean reasoning/thinking tags
+                bot_reply = re.sub(r'<think>.*?</think>', '', bot_reply, flags=re.DOTALL)
+                bot_reply = bot_reply.strip()
+                return {"response": bot_reply}
+            else:
+                generation_elapsed = time.perf_counter() - generation_start
+                print(f"[TIMING] ⚡ Sarvam AI generation failed after: {generation_elapsed:.3f}s")
+                raise HTTPException(
+                    status_code=500, 
+                    detail=f"Sarvam AI API returned code {res.status_code}: {res.text}"
+                )
+        except Exception as e:
+            print(f"[API] Sarvam AI API execution exception: {e}")
+            raise HTTPException(status_code=500, detail=f"Error communicating with Sarvam AI: {str(e)}")
+    else:
+        # Fallback: Query Ollama HTTP API (with timing)
+        prompt_parts = [f"System: {system_instruction}"]
+        for msg in history:
+            role_label = "User" if msg.role == "user" else "Assistant"
+            prompt_parts.append(f"{role_label}: {msg.content}")
+        prompt_parts.append(f"User: {user_query}")
+        prompt_parts.append("Assistant: ")
+        
+        full_prompt = "\n\n".join(prompt_parts)
+        
+        generation_start = time.perf_counter()
+        try:
+            url = f"{OLLAMA_BASE_URL}/api/generate"
+            payload = {
+                "model": OLLAMA_MODEL,
+                "prompt": full_prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0.0
+                }
+            }
+            res = requests.post(url, json=payload, timeout=150)
+            if res.status_code == 200:
+                generation_elapsed = time.perf_counter() - generation_start
+                print(f"[TIMING] ⚡ Answer generation took: {generation_elapsed:.3f}s")
+                print(f"[TIMING] 📊 Total request time: {retrieval_elapsed + generation_elapsed:.3f}s\n")
+                bot_reply = res.json().get("response", "").strip()
+                # Clean reasoning/thinking tags
+                bot_reply = re.sub(r'<think>.*?</think>', '', bot_reply, flags=re.DOTALL)
+                bot_reply = bot_reply.strip()
+                return {"response": bot_reply}
+            else:
+                generation_elapsed = time.perf_counter() - generation_start
+                print(f"[TIMING] ⚡ Answer generation failed after: {generation_elapsed:.3f}s")
+                raise HTTPException(status_code=500, detail=f"Ollama server returned code {res.status_code}")
+                
+        except Exception as e:
+            print(f"[API] Ollama HTTP execution exception: {e}")
+            raise HTTPException(status_code=500, detail=f"Error communicating with local LLM: {str(e)}")
 
 @app.post("/api/search")
 def search_services(request: SearchRequest):
@@ -309,48 +393,87 @@ def search_services(request: SearchRequest):
     
     prompt = (
         "You are an expert service mapping assistant for the SewaSetu Chhattisgarh portal.\n"
-        "Your task is to identify which service from the catalog is the closest match to the user query.\n"
+        "Your task is to identify which specific service from the catalog is the closest match to the user query.\n"
         "The query could be in English, Hindi, or Hinglish (e.g. 'shadi certificate', 'aay praman', 'pani connection').\n\n"
         "Here is the catalog of services:\n"
         f"{services_catalog_desc}\n\n"
         f"User Query: '{query}'\n\n"
         "Instructions:\n"
-        "- Match the query to a service even if it asks about a specific attribute (e.g. SLA, timelines, required documents, kiosk fees, online fees, or how to apply).\n"
+        "- Match the query to a service ONLY if the query explicitly mentions or clearly target that specific service (e.g., marriage, income, domicile, water tap, CMEGP, or film subsidy).\n"
+        "- Do NOT match generic queries like 'certificate', 'fees', 'documents', 'registration', 'apply', or 'how to apply' to any specific service if the query does not specify which service it is about.\n"
+        "- If the query is generic, ambiguous, or does not clearly map to a specific service in the catalog, you MUST return {\"sno\": null, \"service_id\": null}.\n"
         "- Return ONLY a JSON object containing the mapped 'sno' and 'service_id' as strings. For example: {\"sno\": \"1\", \"service_id\": \"3\"}\n"
-        "- If the query does not map to any service in the catalog, return {\"sno\": null, \"service_id\": null}.\n"
         "- Do not explain your choice. Do not output markdown, only raw JSON.\n\n"
         "Output JSON:"
     )
     
-    try:
-        url = "http://localhost:11434/api/generate"
-        payload = {
-            "model": OLLAMA_MODEL,
-            "prompt": prompt,
-            "stream": False,
-            "options": {
-                "temperature": 0.0 # Force deterministic output
+    if USE_SARVAM_API and SARVAM_API_KEY:
+        try:
+            url = "https://api.sarvam.ai/v1/chat/completions"
+            headers = {
+                "api-subscription-key": SARVAM_API_KEY,
+                "Authorization": f"Bearer {SARVAM_API_KEY}",
+                "Content-Type": "application/json"
             }
-        }
-        res = requests.post(url, json=payload, timeout=60) # Higher timeout for first run loading
-        if res.status_code == 200:
-            reply = res.json().get("response", "").strip()
-            
-            # Extract JSON from reply using Regex
-            json_match = re.search(r'\{.*?\}', reply, re.DOTALL)
-            if json_match:
-                json_data = json.loads(json_match.group(0))
-                sno_val = json_data.get("sno")
-                sid_val = json_data.get("service_id")
-                if sno_val and str(sno_val).lower() != "null":
-                    return {
-                        "sno": str(sno_val),
-                        "service_id": str(sid_val) if sid_val else None
-                    }
+            payload = {
+                "model": SARVAM_MODEL,
+                "messages": [
+                    {"role": "user", "content": prompt}
+                ],
+                "temperature": 0.0
+            }
+            print(f"[API] Querying Sarvam AI API for service mapping (Model: {SARVAM_MODEL})...")
+            res = requests.post(url, json=payload, headers=headers, timeout=60)
+            if res.status_code == 200:
+                reply = res.json()["choices"][0]["message"]["content"].strip()
+                # Extract JSON from reply using Regex
+                json_match = re.search(r'\{.*?\}', reply, re.DOTALL)
+                if json_match:
+                    json_data = json.loads(json_match.group(0))
+                    sno_val = json_data.get("sno")
+                    sid_val = json_data.get("service_id")
+                    if sno_val and str(sno_val).lower() != "null":
+                        return {
+                            "sno": str(sno_val),
+                            "service_id": str(sid_val) if sid_val else None
+                        }
+                else:
+                    print(f"[Search API] Failed to extract JSON from Sarvam reply: {reply}")
             else:
-                print(f"[Search API] Failed to extract JSON from reply: {reply}")
-    except Exception as e:
-        print(f"[Search API] Mapping failed with error: {e}")
+                print(f"[Search API] Sarvam AI API returned code {res.status_code}: {res.text}")
+        except Exception as e:
+            print(f"[Search API] Mapping via Sarvam failed: {e}")
+    else:
+        # Fallback: Query local Ollama
+        try:
+            url = f"{OLLAMA_BASE_URL}/api/generate"
+            payload = {
+                "model": OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0.0 # Force deterministic output
+                }
+            }
+            res = requests.post(url, json=payload, timeout=60) # Higher timeout for first run loading
+            if res.status_code == 200:
+                reply = res.json().get("response", "").strip()
+                
+                # Extract JSON from reply using Regex
+                json_match = re.search(r'\{.*?\}', reply, re.DOTALL)
+                if json_match:
+                    json_data = json.loads(json_match.group(0))
+                    sno_val = json_data.get("sno")
+                    sid_val = json_data.get("service_id")
+                    if sno_val and str(sno_val).lower() != "null":
+                        return {
+                            "sno": str(sno_val),
+                            "service_id": str(sid_val) if sid_val else None
+                        }
+                else:
+                    print(f"[Search API] Failed to extract JSON from reply: {reply}")
+        except Exception as e:
+            print(f"[Search API] Mapping failed with error: {e}")
         
     return {"sno": None, "service_id": None}
 

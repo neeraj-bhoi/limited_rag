@@ -59,7 +59,7 @@ def clean_text(text):
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
 
-def chunk_text(text, chunk_size=800, overlap=150):
+def chunk_text(text, chunk_size=1500, overlap=200):
     """
     Splits text into sliding-window chunks with a set overlap.
     """

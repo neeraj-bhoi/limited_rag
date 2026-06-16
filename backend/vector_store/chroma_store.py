@@ -12,7 +12,9 @@ def get_chroma_client():
     if not hasattr(_thread_local, "chroma_client"):
         # Local relative path in the workspace
         workspace_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        db_path = os.getenv("CHROMA_DB_PATH", os.path.join(workspace_dir, "processed_data", "chroma_db"))
+        db_path = os.getenv("CHROMA_DB_PATH")
+        if not db_path:
+            db_path = os.path.join(workspace_dir, "processed_data", "chroma_db")
         print(f"[ChromaStore] Connecting to ChromaDB at: {db_path}")
         _thread_local.chroma_client = chromadb.PersistentClient(path=db_path)
     return _thread_local.chroma_client
