@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 # Append parent directory to system path to import backend modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from backend.chunking.chunker import chunk_text, convert_json_to_markdown
+from backend.chunking.chunker import chunk_text, convert_json_to_markdown, normalize_quotes
 from backend.embeddings.embedder import generate_embeddings
 from backend.vector_store.chroma_store import get_chroma_client, get_collection
 
@@ -132,6 +132,7 @@ def run_ingestion():
                     
                 # Format JSON to clean markdown, excluding massive form fields to optimize prompt size
                 md_content = convert_json_to_markdown(detail_data, lang=lang, exclude_form_fields=True)
+                md_content = normalize_quotes(md_content)
                 
                 # Write to processed_data folder for debugging/manual verification
                 md_out_path = os.path.join(PROCESSED_DIR, "markdown_details", lang, f"{sno}.md")
@@ -171,6 +172,8 @@ def run_ingestion():
             try:
                 with open(full_path, "r", encoding="utf-8") as file:
                     manual_text = file.read()
+                
+                manual_text = normalize_quotes(manual_text)
                     
                 # Split manual into chunks
                 chunks = chunk_text(manual_text)

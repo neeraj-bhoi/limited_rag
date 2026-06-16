@@ -59,6 +59,25 @@ def clean_text(text):
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
 
+def normalize_quotes(text: str) -> str:
+    """
+    Normalizes smart/curly quotes and bullet chars to standard ASCII equivalents.
+    Prevents tokenizer / generation truncation bugs in some LLMs.
+    """
+    if not text:
+        return ""
+    replacements = {
+        '“': '"',
+        '”': '"',
+        '‘': "'",
+        '’': "'",
+        '•': '-',
+        '': '-',
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    return text
+
 def chunk_text(text, chunk_size=1500, overlap=200):
     """
     Splits text into sliding-window chunks with a set overlap.

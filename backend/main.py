@@ -24,6 +24,8 @@ USE_SARVAM_API = os.getenv("USE_SARVAM_API", "false").lower() == "true"
 SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
 SARVAM_MODEL = os.getenv("SARVAM_MODEL", "sarvam-30b")
 
+from backend.chunking.chunker import normalize_quotes
+
 app = FastAPI(title="SewaSetu RAG API Server")
 
 # Configure CORS
@@ -172,62 +174,103 @@ def chat_with_bot(request: ChatRequest):
     2. Constructs a bilingual semantic prompt.
     3. Queries Ollama local server and returns response.
     """
-    user_query = request.messages[-1].content
+    user_query = normalize_quotes(request.messages[-1].content)
     language = request.language
     
-    # 1. Query Chroma vector store (with timing)
+    # 1. Query Chroma vector store or load full files directly
     candidates = []
-    metadata_doc = None
+    metadata_docs = {}  # Map sno -> metadata doc
+    manual_contents = {}  # Map sno -> manual content
     retrieval_start = time.perf_counter()
     try:
         from backend.vector_store.chroma_store import query_vector_store, get_collection
+        collection = get_collection()
         
-        # If a service is selected, retrieve its metadata profile directly
+        target_snos = []
         if request.selected_sno:
-            try:
-                collection = get_collection()
-                doc_id = f"meta_{request.selected_sno}_{language}_0"
-                res = collection.get(ids=[doc_id])
-                if res and "documents" in res and len(res["documents"]) > 0 and res["documents"][0]:
-                    metadata_doc = res["documents"][0]
-            except Exception as e:
-                print(f"[API] Error fetching direct metadata doc: {e}")
+            target_snos = [str(request.selected_sno)]
+        else:
+            # Query vector store to find which services are relevant
+            candidates = query_vector_store(user_query, lang=language, limit=3, sno=None)
+            for res in candidates:
+                sno_val = res["metadata"].get("sno")
+                if sno_val and str(sno_val) not in target_snos:
+                    target_snos.append(str(sno_val))
+                    
+        # Load full files for all target snos
+        if target_snos:
+            if not SERVICES_MAP:
+                load_manifest()
                 
-        # Retrieve top chunks
-        candidates = query_vector_store(user_query, lang=language, limit=3, sno=request.selected_sno)
+            for sno in target_snos:
+                # Load metadata document directly
+                try:
+                    doc_id = f"meta_{sno}_{language}_0"
+                    res = collection.get(ids=[doc_id])
+                    if res and "documents" in res and len(res["documents"]) > 0 and res["documents"][0]:
+                        metadata_docs[sno] = normalize_quotes(res["documents"][0])
+                except Exception as e:
+                    print(f"[API] Error fetching direct metadata doc for sno {sno}: {e}")
+                    
+                # Load manual document directly
+                service_meta = SERVICES_MAP.get(sno)
+                if service_meta:
+                    manual_key = "manual_path_hi" if language == "hi" else "manual_path_en"
+                    rel_path = service_meta.get(manual_key)
+                    if rel_path:
+                        full_path = os.path.join(WORKSPACE_DIR, rel_path)
+                        if os.path.exists(full_path):
+                            try:
+                                with open(full_path, "r", encoding="utf-8") as f:
+                                    content = f.read()
+                                manual_contents[sno] = normalize_quotes(content)
+                                print(f"[API] Loaded full manual context for sno {sno}: {rel_path} ({len(content)} chars)")
+                            except Exception as e:
+                                print(f"[API] Error reading manual file {full_path}: {e}")
+                                
     except Exception as e:
-        print(f"[API] Error querying vector store: {e}")
+        print(f"[API] Error during context retrieval: {e}")
     finally:
         retrieval_elapsed = time.perf_counter() - retrieval_start
-        print(f"\n[TIMING] ⏱  Chunk retrieval took: {retrieval_elapsed:.3f}s")
+        print(f"\n[TIMING] ⏱  Context retrieval took: {retrieval_elapsed:.3f}s")
         
     # Budget-based context compile with source labeling
     context_parts = []
     current_length = 0
-    budget = 10000
+    budget = 25000  # Context budget
     
-    if metadata_doc:
-        header = "[Official Service Specification Profile]"
-        context_parts.append(f"{header}\n{metadata_doc}")
-        current_length += len(header) + len(metadata_doc)
-        
-    for res in candidates:
-        # Avoid duplicate metadata documents in context
-        if res["metadata"].get("type") == "metadata" and metadata_doc:
-            continue
-        doc_text = res["document"]
-        doc_len = len(doc_text)
-        
-        source_label = "[User Manual & Guidelines]" if res["metadata"].get("type") == "manual" else "[Official Service Specification Profile]"
-        chunk_text = f"{source_label}\n{doc_text}"
-        chunk_len = len(chunk_text)
-        
-        if current_length + chunk_len > budget:
-            break
+    # Add metadata and manual content for matched services
+    for sno in target_snos:
+        meta_doc = metadata_docs.get(sno)
+        if meta_doc:
+            header = "[Official Service Specification Profile]"
+            chunk_text = f"{header}\n{meta_doc}"
+            if current_length + len(chunk_text) <= budget:
+                context_parts.append(chunk_text)
+                current_length += len(chunk_text)
+                
+        manual_text = manual_contents.get(sno)
+        if manual_text:
+            header = "[User Manual & Guidelines]"
+            chunk_text = f"{header}\n{manual_text}"
+            if current_length + len(chunk_text) <= budget:
+                context_parts.append(chunk_text)
+                current_length += len(chunk_text)
+                
+    # If no full manuals were loaded, fallback to raw candidates retrieved from vector store
+    if not context_parts and candidates:
+        for res in candidates:
+            doc_text = normalize_quotes(res["document"])
+            source_label = "[User Manual & Guidelines]" if res["metadata"].get("type") == "manual" else "[Official Service Specification Profile]"
+            chunk_text = f"{source_label}\n{doc_text}"
+            chunk_len = len(chunk_text)
             
-        context_parts.append(chunk_text)
-        current_length += chunk_len
-        
+            if current_length + chunk_len > budget:
+                break
+                
+            context_parts.append(chunk_text)
+            current_length += chunk_len
+            
     retrieved_context = "\n\n---\n\n".join(context_parts)
 
     # ── DEBUG: Print chunks being passed to the LLM ──────────────────────────
@@ -277,8 +320,13 @@ def chat_with_bot(request: ChatRequest):
         if retrieved_context:
             system_instruction += f"Relevant Context:\n{retrieved_context}\n\n"
             
+    # Apply quote normalization to system prompt
+    system_instruction = normalize_quotes(system_instruction)
+            
     # Format message history
     history = request.messages[-7:-1] if len(request.messages) > 1 else []
+    for msg in history:
+        msg.content = normalize_quotes(msg.content)
     
     # Check if we should use Sarvam AI API or fall back to local Ollama
     if USE_SARVAM_API and SARVAM_API_KEY:
@@ -312,7 +360,7 @@ def chat_with_bot(request: ChatRequest):
                 bot_reply = res.json()["choices"][0]["message"]["content"].strip()
                 # Clean reasoning/thinking tags
                 bot_reply = re.sub(r'<think>.*?</think>', '', bot_reply, flags=re.DOTALL)
-                bot_reply = bot_reply.strip()
+                bot_reply = normalize_quotes(bot_reply.strip())
                 return {"response": bot_reply}
             else:
                 generation_elapsed = time.perf_counter() - generation_start
@@ -354,7 +402,7 @@ def chat_with_bot(request: ChatRequest):
                 bot_reply = res.json().get("response", "").strip()
                 # Clean reasoning/thinking tags
                 bot_reply = re.sub(r'<think>.*?</think>', '', bot_reply, flags=re.DOTALL)
-                bot_reply = bot_reply.strip()
+                bot_reply = normalize_quotes(bot_reply.strip())
                 return {"response": bot_reply}
             else:
                 generation_elapsed = time.perf_counter() - generation_start
